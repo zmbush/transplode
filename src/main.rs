@@ -1,20 +1,24 @@
 use clap::Parser;
-use eyre::Context as _;
+use eyre::{Context as _, OptionExt as _};
 use ffmpeg_sidecar::ffprobe::ffprobe_path;
-use notify::{EventKind, RecursiveMode};
+use notify::{Config, EventKind, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, new_debouncer};
+use path_slash::{PathBufExt as _, PathExt as _};
+use rpassword::read_password;
+use ssh2::{KeyboardInteractivePrompt, Session};
 use std::{
     collections::HashSet,
+    net::TcpStream,
+    os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 use walkdir::WalkDir;
 
-static HANDBRAKE_CLI: &str = r#"C:\Program Files\HandBrake\HandBrakeCLI.exe"#;
+mod config;
 
-#[derive(Debug, Deserialize)]
-struct Config {}
+static HANDBRAKE_CLI: &str = r#"C:\Program Files\HandBrake\HandBrakeCLI.exe"#;
 
 #[derive(Parser, Clone)]
 #[command(version, about)]
@@ -53,9 +57,9 @@ enum Disposition {
     TryUpload,
 }
 
-async fn file_disposition(path: &Path, cmd: &Cmd) -> Disposition {
-    let from_path = cmd.from.join(path);
-    let to_path = cmd.to.join(path);
+async fn file_disposition(path: &Path, config: &config::Config) -> Disposition {
+    let from_path = config.paths.organized.join(path);
+    let to_path = config.paths.encoded.join(path);
 
     let path_str = path.to_string_lossy();
     if path_str.contains("_riplex") {
@@ -100,6 +104,177 @@ enum Task {
     Discover { path: PathBuf, initial: bool },
     Transcode(PathBuf),
     Upload(PathBuf),
+    Cleanup(PathBuf),
+}
+
+async fn run_transcoder(
+    mut transcode_rx: tokio::sync::mpsc::Receiver<PathBuf>,
+    tx: tokio::sync::mpsc::UnboundedSender<Task>,
+    config: config::Config,
+) -> eyre::Result<()> {
+    let mut transcoded = HashSet::new();
+    while let Some(path) = transcode_rx.recv().await {
+        if !matches!(
+            file_disposition(&path, &config).await,
+            Disposition::NeedsTranscode
+        ) {
+            println!(
+                "Unnecessary transcode skipped... Trying upload ({})",
+                shrinkpath::shrink_to(&path.to_string_lossy(), 50)
+            );
+            tx.send(Task::Upload(path))
+                .context("Failed to enqueue upload event")?;
+            continue;
+        }
+        if transcoded.contains(&path) {
+            continue;
+        }
+        transcoded.insert(path.clone());
+        if let Some(dir) = config.paths.encoded.join(&path).parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        println!(
+            "[Transcode] Processing {}",
+            shrinkpath::shrink_to(&path.to_string_lossy(), 50)
+        );
+        let status = tokio::process::Command::new(HANDBRAKE_CLI)
+            .arg("--preset-import-file")
+            .arg(&config.handbrake.cfg)
+            .args(["-Z", &config.handbrake.preset])
+            .arg("-i")
+            .arg(config.paths.organized.join(&path))
+            .arg("-o")
+            .arg(config.paths.encoded.join(&path))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+        if !status.success() {
+            println!("Handbrake failed! Exiting...");
+            eyre::bail!("Handbrake failed: {status}");
+        }
+        tx.send(Task::Upload(path))
+            .context("Failed to enqueue upload event")?;
+    }
+
+    Ok(())
+}
+
+fn exists_at(sftp: &ssh2::Sftp, expected_size: u64, path: &Path) -> bool {
+    let path = match path.to_slash() {
+        Some(p) => PathBuf::from(p.as_ref()),
+        None => {
+            return false;
+        }
+    };
+    let mut file = match sftp.open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            return false;
+        }
+    };
+    let mut stat = match file.stat() {
+        Ok(f) => f,
+        Err(e) => {
+            return false;
+        }
+    };
+
+    let remote_size = stat.size.unwrap_or(0);
+    expected_size == remote_size
+}
+
+fn ensure_dir_for_file(sftp: &ssh2::Sftp, file: &Path) -> eyre::Result<()> {
+    let mut current_path = String::new();
+
+    let parent_dir = file.parent().ok_or_eyre("no parent")?;
+
+    for component in parent_dir.iter() {
+        current_path.push('/');
+        current_path.push_str(component.to_str().ok_or_eyre("can't convert component")?);
+
+        if sftp.mkdir(Path::new(&current_path), 0o755).is_err() {
+            if sftp.stat(Path::new(&current_path)).is_err() {
+                eyre::bail!("can't make parent directory");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_uploader(
+    sftp: ssh2::Sftp,
+    mut upload_rx: tokio::sync::mpsc::Receiver<PathBuf>,
+    tx: tokio::sync::mpsc::UnboundedSender<Task>,
+    ssh_config: config::Ssh,
+    config: config::Config,
+) -> eyre::Result<()> {
+    'main: while let Some(path) = upload_rx.recv().await {
+        let remote_path = ssh_config.path.join(&path);
+        let local_path = config.paths.encoded.join(&path);
+        let Ok(local_metadata) = std::fs::metadata(&local_path) else {
+            println!(
+                "[Upload] Can't stat local file, skipping {}",
+                shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
+            );
+            continue;
+        };
+        let local_size = local_metadata.file_size();
+
+        if exists_at(&sftp, local_size, &remote_path) {
+            // already exists at expected location
+            continue;
+        }
+        for alternate in &ssh_config.other_paths {
+            if exists_at(&sftp, local_size, &alternate.join(&path)) {
+                // exists in a legacy location
+                continue 'main;
+            }
+        }
+
+        let remote_path = match remote_path.to_slash() {
+            Some(p) => PathBuf::from(p.as_ref()),
+            None => continue,
+        };
+
+        if let Err(e) = ensure_dir_for_file(&sftp, &remote_path) {
+            println!("[Upload] Can't make containing dir: {e}");
+            continue;
+        }
+
+        let mut remote_file = match sftp.create(&remote_path) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("[Upload] Can't create remote file: {e}");
+                continue;
+            }
+        };
+
+        let mut local_file = match std::fs::File::open(&local_path) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("[Upload] Can't open local file to upload: {e}");
+                continue;
+            }
+        };
+
+        println!(
+            "[Upload] Starting... {}",
+            shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
+        );
+
+        if let Err(e) = std::io::copy(&mut local_file, &mut remote_file) {
+            println!("[Upload] Upload failed! {e}");
+            continue;
+        }
+
+        println!(
+            "[Upload] {} uploaded",
+            shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
+        );
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -107,12 +282,13 @@ async fn main() -> eyre::Result<()> {
     ffmpeg_sidecar::download::auto_download()
         .map_err(|e| eyre::eyre!("Could not download ffmpeg {e}"))?;
 
-    let cmd = Cmd::parse();
+    let config = config::load()?;
 
-    std::fs::create_dir_all(&cmd.to)?;
+    std::fs::create_dir_all(&config.paths.organized)?;
 
     let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (transcode_tx, mut transcode_rx) = tokio::sync::mpsc::channel::<PathBuf>(25);
+    let (transcode_tx, transcode_rx) = tokio::sync::mpsc::channel::<PathBuf>(25);
+    let (upload_tx, upload_rx) = tokio::sync::mpsc::channel::<PathBuf>(25);
 
     let mut debouncer = new_debouncer(Duration::from_secs(5), None, {
         let tx = task_tx.clone();
@@ -137,9 +313,9 @@ async fn main() -> eyre::Result<()> {
             Err(e) => println!("Watch error: {:?}", e),
         }
     })?;
-    debouncer.watch(&cmd.from, RecursiveMode::Recursive)?;
+    debouncer.watch(&config.paths.organized, RecursiveMode::Recursive)?;
 
-    for entry in WalkDir::new(&cmd.from) {
+    for entry in WalkDir::new(&config.paths.organized) {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
@@ -153,65 +329,44 @@ async fn main() -> eyre::Result<()> {
             .context("Failed to fill initial task queue")?;
     }
 
-    let transcoder = tokio::spawn({
-        let cmd = cmd.clone();
-        let tx = task_tx.clone();
-        async move {
-            let mut transcoded = HashSet::new();
-            while let Some(path) = transcode_rx.recv().await {
-                if !matches!(
-                    file_disposition(&path, &cmd).await,
-                    Disposition::NeedsTranscode
-                ) {
-                    println!(
-                        "Unnecessary transcode skipped... Trying upload ({})",
-                        shrinkpath::shrink_to(&path.to_string_lossy(), 50)
-                    );
-                    tx.send(Task::Upload(path))
-                        .context("Failed to enqueue upload event")?;
-                    continue;
-                }
-                if transcoded.contains(&path) {
-                    continue;
-                }
-                transcoded.insert(path.clone());
-                if let Some(dir) = cmd.to.join(&path).parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                println!(
-                    "[Transcode] Processing {}",
-                    shrinkpath::shrink_to(&path.to_string_lossy(), 50)
-                );
-                let status = tokio::process::Command::new(HANDBRAKE_CLI)
-                    .arg("--preset-import-file")
-                    .arg(&cmd.config)
-                    .args(["-Z", "Archiving Old Movies"])
-                    .arg("-i")
-                    .arg(cmd.from.join(&path))
-                    .arg("-o")
-                    .arg(cmd.to.join(&path))
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::null())
-                    .status()
-                    .await?;
-                if !status.success() {
-                    println!("Handbrake failed! Exiting...");
-                    eyre::bail!("Handbrake failed: {status}");
-                }
-                tx.send(Task::Upload(path))
-                    .context("Failed to enqueue upload event")?;
-            }
+    let transcoder = tokio::spawn(run_transcoder(
+        transcode_rx,
+        task_tx.clone(),
+        config.clone(),
+    ));
 
-            Ok(())
-        }
-    });
+    let uploader = if let Some(ssh) = &config.ssh {
+        let tcp = TcpStream::connect((ssh.address.clone(), 22))?;
+        println!("[Upload] Initiating connection to {tcp:?}");
+        let mut sess = Session::new()?;
+        sess.set_tcp_stream(tcp);
+
+        sess.handshake()?;
+
+        print!("Enter password: ");
+        let pw = read_password()?;
+
+        sess.userauth_password(&ssh.username, &pw)?;
+
+        let sftp = sess.sftp()?;
+
+        Some(tokio::spawn(run_uploader(
+            sftp,
+            upload_rx,
+            task_tx.clone(),
+            ssh.clone(),
+            config.clone(),
+        )))
+    } else {
+        None
+    };
 
     while let Some(task) = task_rx.recv().await {
         match task {
             Task::Discover { path, initial } => {
-                let path = path.strip_prefix(&cmd.from)?.to_path_buf();
+                let path = path.strip_prefix(&config.paths.organized)?.to_path_buf();
 
-                let disposition = file_disposition(&path, &cmd).await;
+                let disposition = file_disposition(&path, &config).await;
                 if !initial {
                     println!(
                         "[Discover] Checking ({disposition:?}) {}",
@@ -234,13 +389,24 @@ async fn main() -> eyre::Result<()> {
                     .context("Failed to send transcode path")?;
             }
             Task::Upload(path) => {
+                upload_tx
+                    .send(path)
+                    .await
+                    .context("Failed to send upload path")?;
+            }
+            Task::Cleanup(path) => {
                 println!(
-                    "[Upload] STUB - upload to server ({})",
+                    "[Cleanup] STUB - {}",
                     shrinkpath::shrink_to(&path.to_string_lossy(), 50)
                 );
             }
         }
     }
 
-    transcoder.await?
+    transcoder.await??;
+    if let Some(uploader) = uploader {
+        uploader.await??;
+    }
+
+    Ok(())
 }
