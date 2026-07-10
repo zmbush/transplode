@@ -1,17 +1,20 @@
 use clap::Parser;
 use eyre::{Context as _, OptionExt as _};
 use ffmpeg_sidecar::ffprobe::ffprobe_path;
-use notify::{Config, EventKind, RecursiveMode};
+use notify::{Config, ErrorKind::InvalidConfig, EventKind, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, new_debouncer};
 use path_slash::{PathBufExt as _, PathExt as _};
 use rpassword::read_password;
-use ssh2::{KeyboardInteractivePrompt, Session};
+use run_on_drop::on_drop;
+use russh_sftp::client::{self, SftpSession};
 use std::{
     collections::HashSet,
+    io::Write as _,
     net::TcpStream,
     os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 use walkdir::WalkDir;
@@ -114,6 +117,13 @@ async fn run_transcoder(
 ) -> eyre::Result<()> {
     let mut transcoded = HashSet::new();
     while let Some(path) = transcode_rx.recv().await {
+        let _next_step = on_drop({
+            let path = path.clone();
+            || {
+                tx.send(Task::Upload(path))
+                    .expect("Couldn't move on to next step")
+            }
+        });
         if !matches!(
             file_disposition(&path, &config).await,
             Disposition::NeedsTranscode
@@ -122,8 +132,6 @@ async fn run_transcoder(
                 "Unnecessary transcode skipped... Trying upload ({})",
                 shrinkpath::shrink_to(&path.to_string_lossy(), 50)
             );
-            tx.send(Task::Upload(path))
-                .context("Failed to enqueue upload event")?;
             continue;
         }
         if transcoded.contains(&path) {
@@ -153,50 +161,52 @@ async fn run_transcoder(
             println!("Handbrake failed! Exiting...");
             eyre::bail!("Handbrake failed: {status}");
         }
-        tx.send(Task::Upload(path))
-            .context("Failed to enqueue upload event")?;
     }
 
     Ok(())
 }
 
-fn exists_at(sftp: &ssh2::Sftp, expected_size: u64, path: &Path) -> bool {
+async fn exists_at(sftp: &SftpSession, expected_size: u64, path: &Path) -> bool {
     let path = match path.to_slash() {
-        Some(p) => PathBuf::from(p.as_ref()),
+        Some(p) => p.to_string(),
         None => {
             return false;
         }
     };
-    let mut file = match sftp.open(path) {
+    let file = match sftp.open(path).await {
         Ok(f) => f,
         Err(e) => {
             return false;
         }
     };
-    let mut stat = match file.stat() {
+    let metadata = match file.metadata().await {
         Ok(f) => f,
         Err(e) => {
             return false;
         }
     };
 
-    let remote_size = stat.size.unwrap_or(0);
+    let remote_size = metadata.size.unwrap_or(0);
     expected_size == remote_size
 }
 
-fn ensure_dir_for_file(sftp: &ssh2::Sftp, file: &Path) -> eyre::Result<()> {
+async fn ensure_dir_for_file(sftp: &SftpSession, file: &str) -> eyre::Result<()> {
+    let file = PathBuf::from(file);
     let mut current_path = String::new();
 
     let parent_dir = file.parent().ok_or_eyre("no parent")?;
 
     for component in parent_dir.iter() {
+        if component == "/" || component == "\\" {
+            continue;
+        }
         current_path.push('/');
         current_path.push_str(component.to_str().ok_or_eyre("can't convert component")?);
 
-        if sftp.mkdir(Path::new(&current_path), 0o755).is_err() {
-            if sftp.stat(Path::new(&current_path)).is_err() {
-                eyre::bail!("can't make parent directory");
-            }
+        if sftp.create_dir(&current_path).await.is_err()
+            && sftp.fs_info(&current_path).await.is_err()
+        {
+            eyre::bail!("can't make parent directory");
         }
     }
 
@@ -204,13 +214,20 @@ fn ensure_dir_for_file(sftp: &ssh2::Sftp, file: &Path) -> eyre::Result<()> {
 }
 
 async fn run_uploader(
-    sftp: ssh2::Sftp,
+    sftp: SftpSession,
     mut upload_rx: tokio::sync::mpsc::Receiver<PathBuf>,
     tx: tokio::sync::mpsc::UnboundedSender<Task>,
     ssh_config: config::Ssh,
     config: config::Config,
 ) -> eyre::Result<()> {
     'main: while let Some(path) = upload_rx.recv().await {
+        let _next_step = on_drop({
+            let path = path.clone();
+            || {
+                tx.send(Task::Cleanup(path))
+                    .expect("Couldn't move on to next step")
+            }
+        });
         let remote_path = ssh_config.path.join(&path);
         let local_path = config.paths.encoded.join(&path);
         let Ok(local_metadata) = std::fs::metadata(&local_path) else {
@@ -218,42 +235,49 @@ async fn run_uploader(
                 "[Upload] Can't stat local file, skipping {}",
                 shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
             );
+            _next_step.forget();
             continue;
         };
         let local_size = local_metadata.file_size();
 
-        if exists_at(&sftp, local_size, &remote_path) {
+        if exists_at(&sftp, local_size, &remote_path).await {
             // already exists at expected location
             continue;
         }
         for alternate in &ssh_config.other_paths {
-            if exists_at(&sftp, local_size, &alternate.join(&path)) {
+            if exists_at(&sftp, local_size, &alternate.join(&path)).await {
                 // exists in a legacy location
                 continue 'main;
             }
         }
 
         let remote_path = match remote_path.to_slash() {
-            Some(p) => PathBuf::from(p.as_ref()),
-            None => continue,
+            Some(p) => p.to_string(),
+            None => {
+                _next_step.forget();
+                continue;
+            }
         };
 
-        if let Err(e) = ensure_dir_for_file(&sftp, &remote_path) {
+        if let Err(e) = ensure_dir_for_file(&sftp, &remote_path).await {
             println!("[Upload] Can't make containing dir: {e}");
+            _next_step.forget();
             continue;
         }
 
-        let mut remote_file = match sftp.create(&remote_path) {
+        let mut remote_file = match sftp.create(&remote_path).await {
             Ok(f) => f,
             Err(e) => {
+                _next_step.forget();
                 println!("[Upload] Can't create remote file: {e}");
                 continue;
             }
         };
 
-        let mut local_file = match std::fs::File::open(&local_path) {
+        let mut local_file = match tokio::fs::File::open(&local_path).await {
             Ok(f) => f,
             Err(e) => {
+                _next_step.forget();
                 println!("[Upload] Can't open local file to upload: {e}");
                 continue;
             }
@@ -264,8 +288,9 @@ async fn run_uploader(
             shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
         );
 
-        if let Err(e) = std::io::copy(&mut local_file, &mut remote_file) {
+        if let Err(e) = tokio::io::copy(&mut local_file, &mut remote_file).await {
             println!("[Upload] Upload failed! {e}");
+            _next_step.forget();
             continue;
         }
 
@@ -275,6 +300,18 @@ async fn run_uploader(
         );
     }
     Ok(())
+}
+
+struct Client;
+impl russh::client::Handler for Client {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
 }
 
 #[tokio::main]
@@ -336,19 +373,25 @@ async fn main() -> eyre::Result<()> {
     ));
 
     let uploader = if let Some(ssh) = &config.ssh {
-        let tcp = TcpStream::connect((ssh.address.clone(), 22))?;
-        println!("[Upload] Initiating connection to {tcp:?}");
-        let mut sess = Session::new()?;
-        sess.set_tcp_stream(tcp);
-
-        sess.handshake()?;
+        let ssh_config = russh::client::Config::default();
+        let sh = Client;
+        let mut session =
+            russh::client::connect(Arc::new(ssh_config), (ssh.address.clone(), 22), sh).await?;
 
         print!("Enter password: ");
+        std::io::stdout().flush()?;
+
         let pw = read_password()?;
-
-        sess.userauth_password(&ssh.username, &pw)?;
-
-        let sftp = sess.sftp()?;
+        if !session
+            .authenticate_password(&ssh.username, &pw)
+            .await?
+            .success()
+        {
+            eyre::bail!("No SSH connection");
+        }
+        let channel = session.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(channel.into_stream()).await?;
 
         Some(tokio::spawn(run_uploader(
             sftp,

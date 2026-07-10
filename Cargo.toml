@@ -12,10 +12,18 @@ notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 path-slash = "0.2.1"
 rpassword = "7.5.4"
+run-on-drop = "1.0.0"
+russh = { version = "0.62.2", features = [
+    "flate2",
+    "ring",
+    "rsa",
+], default-features = false }
+russh-sftp = "2.3.0"
 serde = { version = "1.0.228", features = ["derive"] }
 shrinkpath = "0.1.1"
-ssh2 = { version = "0.9.6", features = ["openssl-on-win32"] }
+# ssh2 = { version = "0.9.6", features = ["openssl-on-win32"] }
 tokio = { version = "1.52.3", features = [
+    "fs",
     "macros",
     "process",
     "rt",
