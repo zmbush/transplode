@@ -1,27 +1,37 @@
 use clap::Parser;
 use eyre::{Context as _, OptionExt as _};
 use ffmpeg_sidecar::ffprobe::ffprobe_path;
-use notify::{Config, ErrorKind::InvalidConfig, EventKind, RecursiveMode};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use notify::{EventKind, RecursiveMode};
 use notify_debouncer_full::{DebouncedEvent, new_debouncer};
 use path_slash::{PathBufExt as _, PathExt as _};
 use rpassword::read_password;
 use run_on_drop::on_drop;
-use russh_sftp::client::{self, SftpSession};
+use russh_sftp::client::SftpSession;
 use std::{
     collections::HashSet,
     io::Write as _,
-    net::TcpStream,
     os::windows::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
 };
+use tokio::io::{AsyncReadExt as _, BufReader};
 use walkdir::WalkDir;
 
 mod config;
 
 static HANDBRAKE_CLI: &str = r#"C:\Program Files\HandBrake\HandBrakeCLI.exe"#;
+
+static P_D: &str = "[Discover] ";
+static P_E: &str = "  [Encode] ";
+static P_U: &str = "  [Upload] ";
+static P_C: &str = " [Cleanup] ";
+
+fn short_path<P: AsRef<Path>>(p: P) -> String {
+    shrinkpath::shrink_to(&p.as_ref().to_string_lossy(), 50)
+}
 
 #[derive(Parser, Clone)]
 #[command(version, about)]
@@ -113,7 +123,7 @@ enum Task {
 async fn run_transcoder(
     mut transcode_rx: tokio::sync::mpsc::Receiver<PathBuf>,
     tx: tokio::sync::mpsc::UnboundedSender<Task>,
-    config: config::Config,
+    context: Context,
 ) -> eyre::Result<()> {
     let mut transcoded = HashSet::new();
     while let Some(path) = transcode_rx.recv().await {
@@ -124,42 +134,62 @@ async fn run_transcoder(
                     .expect("Couldn't move on to next step")
             }
         });
+
+        let spinner = context.progress(1, format!("{P_E}{}", short_path(&path)));
+
         if !matches!(
-            file_disposition(&path, &config).await,
+            file_disposition(&path, &context.config).await,
             Disposition::NeedsTranscode
         ) {
-            println!(
-                "Unnecessary transcode skipped... Trying upload ({})",
-                shrinkpath::shrink_to(&path.to_string_lossy(), 50)
-            );
+            spinner.finish_and_clear();
             continue;
         }
         if transcoded.contains(&path) {
             continue;
         }
         transcoded.insert(path.clone());
-        if let Some(dir) = config.paths.encoded.join(&path).parent() {
+        if let Some(dir) = context.config.paths.encoded.join(&path).parent() {
             std::fs::create_dir_all(dir)?;
         }
-        println!(
-            "[Transcode] Processing {}",
-            shrinkpath::shrink_to(&path.to_string_lossy(), 50)
-        );
-        let status = tokio::process::Command::new(HANDBRAKE_CLI)
+        spinner.set_message("processing");
+        let mut cmd = tokio::process::Command::new(HANDBRAKE_CLI)
             .arg("--preset-import-file")
-            .arg(&config.handbrake.cfg)
-            .args(["-Z", &config.handbrake.preset])
+            .arg(&context.config.handbrake.cfg)
+            .args(["-Z", &context.config.handbrake.preset])
             .arg("-i")
-            .arg(config.paths.organized.join(&path))
+            .arg(context.config.paths.organized.join(&path))
             .arg("-o")
-            .arg(config.paths.encoded.join(&path))
-            .stdout(Stdio::inherit())
+            .arg(context.config.paths.encoded.join(&path))
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .status()
-            .await?;
+            .spawn()?;
+
+        let stdout_stream = cmd.stdout.take().ok_or_eyre("no stdout to capture")?;
+        let mut reader = BufReader::new(stdout_stream);
+        let mut buffer = [0; 128];
+        let mut line = Vec::new();
+
+        loop {
+            let bytes_read = reader.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+            for &byte in &buffer[..bytes_read] {
+                if byte == b'\r' {
+                    spinner.set_message(std::str::from_utf8(&line)?.to_string());
+                    line.clear();
+                } else {
+                    line.push(byte);
+                }
+            }
+        }
+
+        let status = cmd.wait().await?;
         if !status.success() {
-            println!("Handbrake failed! Exiting...");
+            spinner.finish_with_message("Handbrake failed!");
             eyre::bail!("Handbrake failed: {status}");
+        } else {
+            spinner.finish_with_message("done.");
         }
     }
 
@@ -175,13 +205,13 @@ async fn exists_at(sftp: &SftpSession, expected_size: u64, path: &Path) -> bool 
     };
     let file = match sftp.open(path).await {
         Ok(f) => f,
-        Err(e) => {
+        Err(_) => {
             return false;
         }
     };
     let metadata = match file.metadata().await {
         Ok(f) => f,
-        Err(e) => {
+        Err(_) => {
             return false;
         }
     };
@@ -218,7 +248,7 @@ async fn run_uploader(
     mut upload_rx: tokio::sync::mpsc::Receiver<PathBuf>,
     tx: tokio::sync::mpsc::UnboundedSender<Task>,
     ssh_config: config::Ssh,
-    config: config::Config,
+    context: Context,
 ) -> eyre::Result<()> {
     'main: while let Some(path) = upload_rx.recv().await {
         let _next_step = on_drop({
@@ -229,16 +259,16 @@ async fn run_uploader(
             }
         });
         let remote_path = ssh_config.path.join(&path);
-        let local_path = config.paths.encoded.join(&path);
+        let local_path = context.config.paths.encoded.join(&path);
+        let bar = context.bar(1, format!("{P_U}{}", short_path(&path)));
         let Ok(local_metadata) = std::fs::metadata(&local_path) else {
-            println!(
-                "[Upload] Can't stat local file, skipping {}",
-                shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
-            );
+            bar.finish_with_message("Can't stat local file.");
             _next_step.forget();
             continue;
         };
         let local_size = local_metadata.file_size();
+        bar.set_length(local_size);
+        bar.set_message("preparing...");
 
         if exists_at(&sftp, local_size, &remote_path).await {
             // already exists at expected location
@@ -260,7 +290,7 @@ async fn run_uploader(
         };
 
         if let Err(e) = ensure_dir_for_file(&sftp, &remote_path).await {
-            println!("[Upload] Can't make containing dir: {e}");
+            bar.finish_with_message(format!("Can't make containing dir on remote. {e}"));
             _next_step.forget();
             continue;
         }
@@ -269,35 +299,31 @@ async fn run_uploader(
             Ok(f) => f,
             Err(e) => {
                 _next_step.forget();
-                println!("[Upload] Can't create remote file: {e}");
+                bar.finish_with_message(format!("Can't open file on remote. {e}"));
                 continue;
             }
         };
 
-        let mut local_file = match tokio::fs::File::open(&local_path).await {
+        let local_file = match tokio::fs::File::open(&local_path).await {
             Ok(f) => f,
             Err(e) => {
                 _next_step.forget();
-                println!("[Upload] Can't open local file to upload: {e}");
+                bar.finish_with_message(format!("Can't open local file to upload. {e}"));
                 continue;
             }
         };
 
-        println!(
-            "[Upload] Starting... {}",
-            shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
-        );
+        bar.set_message("copying...");
+
+        let mut local_file = bar.wrap_async_read(local_file);
 
         if let Err(e) = tokio::io::copy(&mut local_file, &mut remote_file).await {
-            println!("[Upload] Upload failed! {e}");
+            bar.finish_with_message(format!("Failed {e}"));
             _next_step.forget();
             continue;
+        } else {
+            bar.finish_with_message("done.")
         }
-
-        println!(
-            "[Upload] {} uploaded",
-            shrinkpath::shrink_to(&local_path.to_string_lossy(), 50)
-        );
     }
     Ok(())
 }
@@ -314,14 +340,54 @@ impl russh::client::Handler for Client {
     }
 }
 
+#[derive(Clone)]
+struct Context {
+    config: config::Config,
+    progress: MultiProgress,
+    progress_bar: ProgressStyle,
+    progress_plain: ProgressStyle,
+}
+
+impl Context {
+    fn bar<S: Into<String>>(&self, len: u64, prefix: S) -> ProgressBar {
+        let pb = self.progress.add(ProgressBar::new(len));
+        pb.set_style(self.progress_bar.clone());
+        pb.set_prefix(prefix.into());
+
+        pb
+    }
+
+    fn progress<S: Into<String>>(&self, len: u64, prefix: S) -> ProgressBar {
+        let pb = self.progress.add(ProgressBar::new(len));
+        pb.set_style(self.progress_plain.clone());
+        pb.set_prefix(prefix.into());
+
+        pb
+    }
+}
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     ffmpeg_sidecar::download::auto_download()
         .map_err(|e| eyre::eyre!("Could not download ffmpeg {e}"))?;
 
-    let config = config::load()?;
+    let progress = MultiProgress::new();
+    let progress_bar = ProgressStyle::with_template(
+        "[{elapsed_precise}] {prefix:.bold.dim} {bar:40.cyan/blue} {pos:7}/{len:7} {msg}",
+    )?
+    .progress_chars("##-");
+    let progress_plain =
+        ProgressStyle::with_template("[{elapsed_precise}] {prefix:.bold.dim} {wide_msg}")?;
 
-    std::fs::create_dir_all(&config.paths.organized)?;
+    let config = config::load()?;
+    let context = Context {
+        config,
+        progress,
+        progress_bar,
+        progress_plain,
+    };
+
+    std::fs::create_dir_all(&context.config.paths.organized)?;
 
     let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
     let (transcode_tx, transcode_rx) = tokio::sync::mpsc::channel::<PathBuf>(25);
@@ -350,9 +416,9 @@ async fn main() -> eyre::Result<()> {
             Err(e) => println!("Watch error: {:?}", e),
         }
     })?;
-    debouncer.watch(&config.paths.organized, RecursiveMode::Recursive)?;
+    debouncer.watch(&context.config.paths.organized, RecursiveMode::Recursive)?;
 
-    for entry in WalkDir::new(&config.paths.organized) {
+    for entry in WalkDir::new(&context.config.paths.organized) {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
@@ -369,10 +435,10 @@ async fn main() -> eyre::Result<()> {
     let transcoder = tokio::spawn(run_transcoder(
         transcode_rx,
         task_tx.clone(),
-        config.clone(),
+        context.clone(),
     ));
 
-    let uploader = if let Some(ssh) = &config.ssh {
+    let uploader = if let Some(ssh) = &context.config.ssh {
         let ssh_config = russh::client::Config::default();
         let sh = Client;
         let mut session =
@@ -398,7 +464,7 @@ async fn main() -> eyre::Result<()> {
             upload_rx,
             task_tx.clone(),
             ssh.clone(),
-            config.clone(),
+            context.clone(),
         )))
     } else {
         None
@@ -407,15 +473,11 @@ async fn main() -> eyre::Result<()> {
     while let Some(task) = task_rx.recv().await {
         match task {
             Task::Discover { path, initial } => {
-                let path = path.strip_prefix(&config.paths.organized)?.to_path_buf();
-
-                let disposition = file_disposition(&path, &config).await;
-                if !initial {
-                    println!(
-                        "[Discover] Checking ({disposition:?}) {}",
-                        shrinkpath::shrink_to(&path.to_string_lossy(), 50)
-                    );
-                }
+                let path = path
+                    .strip_prefix(&context.config.paths.organized)?
+                    .to_path_buf();
+                let spinner = context.progress(1, format!("{P_D}{}", short_path(&path)));
+                let disposition = file_disposition(&path, &context.config).await;
                 if let Some(task) = match disposition {
                     Disposition::NeedsTranscode => Some(Task::Transcode(path)),
                     Disposition::TryUpload => Some(Task::Upload(path)),
@@ -423,6 +485,12 @@ async fn main() -> eyre::Result<()> {
                     Disposition::NeedsCopy | Disposition::Skip => None,
                 } {
                     task_tx.send(task).context("Failed to enqueue next task")?;
+                }
+
+                if initial || matches!(disposition, Disposition::Skip) {
+                    spinner.finish_and_clear();
+                } else {
+                    spinner.finish_with_message(format!("{disposition:?}"));
                 }
             }
             Task::Transcode(path) => {
@@ -438,10 +506,12 @@ async fn main() -> eyre::Result<()> {
                     .context("Failed to send upload path")?;
             }
             Task::Cleanup(path) => {
-                println!(
-                    "[Cleanup] STUB - {}",
-                    shrinkpath::shrink_to(&path.to_string_lossy(), 50)
-                );
+                let spinner = context.progress(1, format!("{P_C}{}", short_path(&path)));
+                if let Err(e) = trash::delete(context.config.paths.organized.join(&path)) {
+                    spinner.finish_with_message(format!("failed. {e}"));
+                } else {
+                    spinner.finish_with_message("done.")
+                }
             }
         }
     }
