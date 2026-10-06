@@ -15,7 +15,7 @@ path-slash = "0.2.1"
 regex = "1.13.0"
 rpassword = "7.5.4"
 run-on-drop = "1.0.0"
-russh = { version = "0.62.2", features = [
+russh = { version = "0.63.2", features = [
     "flate2",
     "ring",
     "rsa",
